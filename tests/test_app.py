@@ -951,7 +951,7 @@ class SessionAndHostingTests(unittest.TestCase):
             conn = server.db()
             u = server.one(conn, 'SELECT * FROM users WHERE username = ?', ('manager',))
             old = int(time.time()) - 10
-            self.assertIsNone(server.read_session_token(conn, f"{u['id']}.{old}.{server.sign_session(conn, u['id'], old, u['password_hash'])}"))
+            self.assertIsNone(server.read_session_token(conn, f"{u['id']}.{old}.{server.sign_session(conn, u, old)}"))
             conn.close()
             # changing your own password keeps you signed in here but ends other sessions
             other = Client(base)
@@ -984,6 +984,22 @@ class SessionAndHostingTests(unittest.TestCase):
         server.CONFIG['db'] = dbs[1]
         conn = server.db()
         self.assertEqual(server.read_session_token(conn, token)['username'], 'admin')  # valid on the other copy
+        conn.close()
+        # a restore or password change on one copy must not sign people out on the others
+        server.CONFIG['db'] = dbs[0]
+        conn = server.db()
+        server.end_all_sessions(conn)
+        conn.execute("UPDATE users SET password_hash = ? WHERE username = 'admin'", (server.hash_password('Changed-on-A-1'),))
+        conn.commit()
+        token_a = server.make_session_token(conn, server.one(conn, "SELECT * FROM users WHERE username = 'admin'"))
+        self.assertEqual(server.read_session_token(conn, token)['username'], 'admin')
+        conn.close()
+        server.CONFIG['db'] = dbs[1]
+        conn = server.db()
+        self.assertEqual(server.read_session_token(conn, token_a)['username'], 'admin')
+        manager = server.one(conn, "SELECT * FROM users WHERE username = 'manager'")
+        forged = f"{manager['id']}.{token_a.split('.', 1)[1]}"
+        self.assertIsNone(server.read_session_token(conn, forged))  # still bound to the user
         conn.close()
 
     def test_vercel_entry_point(self):

@@ -420,7 +420,8 @@ def clear_fails(key):
 # Sessions are signed cookies, not database rows, so they keep working when a cloud host
 # spreads requests over several copies of the app. A token is "user_id.expiry.signature";
 # the signature covers the user's password hash (changing a password signs them out
-# everywhere) and a session epoch (a restore signs everyone out).
+# everywhere) and a session epoch (a restore signs everyone out). In the hosted demo each
+# copy has its own database, so the signature covers only what every copy shares.
 
 def session_secret(conn):
     env = os.environ.get('SHIFTTABLE_SECRET')
@@ -440,14 +441,17 @@ def session_epoch(conn):
     return row[0] if row else '0'
 
 
-def sign_session(conn, uid, exp, password_hash):
-    msg = f'{uid}.{exp}.{session_epoch(conn)}.{hashlib.sha256(password_hash.encode()).hexdigest()}'
+def sign_session(conn, user, exp):
+    if CONFIG['demo']:
+        msg = f"demo.{user['id']}.{exp}.{user['username']}"
+    else:
+        msg = f"{user['id']}.{exp}.{session_epoch(conn)}.{hashlib.sha256(user['password_hash'].encode()).hexdigest()}"
     return hmac.new(session_secret(conn), msg.encode(), hashlib.sha256).hexdigest()
 
 
 def make_session_token(conn, user):
     exp = int(time.time()) + SESSION_HOURS * 3600
-    return f"{user['id']}.{exp}.{sign_session(conn, user['id'], exp, user['password_hash'])}"
+    return f"{user['id']}.{exp}.{sign_session(conn, user, exp)}"
 
 
 def read_session_token(conn, token):
@@ -459,7 +463,7 @@ def read_session_token(conn, token):
     if exp < time.time():
         return None
     u = one(conn, 'SELECT * FROM users WHERE id = ? AND active = 1', (uid,))
-    if not u or not hmac.compare_digest(sig, sign_session(conn, uid, exp, u['password_hash'])):
+    if not u or not hmac.compare_digest(sig, sign_session(conn, u, exp)):
         return None
     return u
 

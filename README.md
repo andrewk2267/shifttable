@@ -33,6 +33,8 @@ rename it or add more branches in **Settings → Branches**.
 
 ## Live demo on Vercel
 
+**<https://shifttable-red.vercel.app>**: sign in with any of the demo logins below.
+
 The repository deploys to Vercel as a **live demo**:
 
 - `api/index.py` runs the same server as a Vercel Python function, and `vercel.json`
@@ -40,10 +42,12 @@ The repository deploys to Vercel as a **live demo**:
 - Vercel functions have no permanent disk. The database lives in `/tmp` and is
   re-created with the F&B demo whenever Vercel starts a fresh copy, so **changes don't
   last**. It shows the product, it doesn't store real rosters.
+- When it's busy, Vercel runs several copies at once, each with its own demo database.
+  An edit then only shows while your requests reach the copy that made it.
 - For real use, run it on your own computer or a server with a disk (the instructions
   below), or move the data to a hosted database.
 - Sign-ins are signed cookies, so they keep working when Vercel moves you between
-  copies of the app.
+  copies of the app. In the demo, a restore or password change doesn't sign anyone out.
 - Environment variables:
   - `SHIFTTABLE_SECRET` (a long random string that signs sign-in cookies)
   - `SHIFTTABLE_UTC_OFFSET` (`8` for Singapore time; Vercel servers run on UTC)
@@ -218,7 +222,7 @@ cd ShiftTable
 python3 -m unittest discover -s tests -v
 ```
 
-The 50 tests cover:
+The 54 tests cover:
 - **The rule engine**: every labour rule, cross-branch limits, branch setup, holiday pay,
   closures, coverage, auto-fill fairness and home-branch preference, clock-record
   matching, and a 30-person two-branch week.
@@ -227,6 +231,8 @@ The 50 tests cover:
   people filters, and the actual-vs-rostered report.
 - **Data handling**: backup, restore and CSV/clock imports including bad files, all three
   sample businesses, and upgrading a first-version database and backup.
+- **Hosting**: signed sign-in cookies (tampering, expiry, sharing across demo copies),
+  the Vercel entry point and the business clock offset.
 
 They use temporary databases and never touch `roster.db`.
 
