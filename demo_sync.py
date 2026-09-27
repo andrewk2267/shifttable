@@ -287,10 +287,14 @@ class DemoSync:
             return {n: z.read(n) for n in z.namelist() if SNAP_RE.match(n)}
 
     def _forget(self, pathname):
-        try:
-            self.store.delete([pathname])
-        except BlobError as e:
-            log(e)
+        """Delete an unused snapshot zip in the background: nothing waits on it, and a
+        leftover zip does no harm."""
+        def delete():
+            try:
+                self.store.delete([pathname])
+            except BlobError as e:
+                log(e)
+        threading.Thread(target=delete, daemon=True).start()
 
 
 def _fingerprint(raw):

@@ -1228,7 +1228,11 @@ class SharedDemoTests(unittest.TestCase):
         bundle = read_setting(b.db_path, '_demo_backups')
         self.assertIn(bundle, self.blob.files)
         self.assertEqual(c.call('DELETE', f'/api/data/backups/{name}')[0], 200)
-        self.assertNotIn(bundle, self.blob.files)  # the old zip is cleaned up
+        for _ in range(50):  # the old zip is cleaned up in the background
+            if bundle not in self.blob.files:
+                break
+            time.sleep(0.05)
+        self.assertNotIn(bundle, self.blob.files)
         b.pull()
         self.assertEqual(os.listdir(b.backups), [])
 
