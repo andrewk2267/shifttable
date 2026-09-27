@@ -863,8 +863,9 @@ async function showLogin(message) {
   try {
     const pub = await api('GET', '/api/public');
     $('#login-biz').textContent = pub.business_name;
+    if (pub.demo) $('.art-foot').textContent = 'This live demo keeps nothing for long. For your own rosters, run it on your computer, where the data stays in a SQLite file next to the app.';
     const demo = pub.demo_logins || [];
-    setHTML($('#demo-logins'), html`${pub.demo ? html`<div class="notice" style="margin-bottom:10px">${icon('info')}<span><b>Live demo.</b> Sample data resets from time to time, so feel free to try anything.</span></div>` : ''}${demo.length ? html`<div class="demo-box"><span class="label">${icon('info', 'i-sm')}Demo logins (turn off in Settings)</span>
+    setHTML($('#demo-logins'), html`${pub.demo ? html`<div class="notice" style="margin-bottom:10px">${icon('info')}<span><b>Live demo.</b> Changes aren't kept for long and the sample data resets, so feel free to try anything.</span></div>` : ''}${demo.length ? html`<div class="demo-box"><span class="label">${icon('info', 'i-sm')}Demo logins (turn off in Settings)</span>
       <div class="demo-btns">${demo.map(d => html`<button type="button" data-demo-user="${d.username}" data-demo-pass="${d.password}"><b>${d.label}</b><small>${d.username}</small></button>`)}</div></div>` : ''}`);
   } catch (e) { err.hidden = false; err.textContent = e.message; }
   setTimeout(() => $('#login-form').elements.username.focus(), 0);
