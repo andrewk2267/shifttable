@@ -3,6 +3,7 @@
 Run from the ShiftTable folder:  python3 -m unittest discover -s tests -v
 """
 import base64
+import hashlib
 import http.cookiejar
 import json
 import os
@@ -14,13 +15,18 @@ import threading
 import time
 import unittest
 import urllib.error
+import urllib.parse
 import urllib.request
+import zlib
 from datetime import date, timedelta
+from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
+from unittest import mock
 
 os.environ.setdefault('SHIFTTABLE_PBKDF2_ITER', '2000')  # fast hashing for tests only
 os.environ['SHIFTTABLE_QUIET'] = '1'
 sys.path.insert(0, os.path.join(os.path.dirname(__file__), '..'))
 
+import demo_sync  # noqa: E402
 import rules  # noqa: E402
 import sample_data  # noqa: E402
 import server  # noqa: E402
@@ -268,6 +274,7 @@ class Client:
         self.base = base
         self.jar = http.cookiejar.CookieJar()
         self.op = urllib.request.build_opener(urllib.request.HTTPCookieProcessor(self.jar))
+        self.headers = None  # of the last response
 
     def call(self, method, path, body=None, csrf=True, raw=False):
         data = json.dumps(body).encode() if body is not None else None
@@ -278,9 +285,11 @@ class Client:
             req.add_header('X-ShiftTable', '1')
         try:
             with self.op.open(req) as r:
+                self.headers = r.headers
                 payload = r.read()
                 return r.status, (payload if raw else json.loads(payload or b'null'))
         except urllib.error.HTTPError as e:
+            self.headers = e.headers
             payload = e.read()
             try:
                 return e.code, json.loads(payload)
@@ -971,12 +980,6 @@ class SessionAndHostingTests(unittest.TestCase):
             server.serverless_setup()
             self.assertTrue(server.CONFIG['demo'])
             dbs.append(server.CONFIG['db'])
-        hashes = []
-        for path in dbs:
-            conn = sqlite3.connect(path)
-            hashes.append(conn.execute("SELECT password_hash FROM users WHERE username = 'admin'").fetchone()[0])
-            conn.close()
-        self.assertEqual(hashes[0], hashes[1])
         server.CONFIG['db'] = dbs[0]
         conn = server.db()
         token = server.make_session_token(conn, server.one(conn, "SELECT * FROM users WHERE username = 'admin'"))
@@ -1044,6 +1047,238 @@ class ScaleTest(unittest.TestCase):
         self.assertEqual(ev['totals']['errors'], 0)
         self.assertFalse({'branch', 'rest', 'overlap'} & set(codes(ev)))
         self.assertGreaterEqual(ev['totals']['coverage_pct'], 90)
+
+
+# ================================================================ hosted demo: one shared database
+
+BLOB_TOKEN = 'vercel_blob_rw_teststore_s3cret'
+RealBlobStore = demo_sync.BlobStore
+
+
+class FakeBlob:
+    """Stands in for Vercel Blob: files by pathname with ETags, conditional writes and deletes."""
+
+    def __init__(self):
+        self.files = {}
+        self.before_put = None  # run once as the shared database's next upload arrives
+        fake = self
+
+        class H(BaseHTTPRequestHandler):
+            def log_message(self, *args):
+                pass
+
+            def reply(self, status, body=b'', headers=()):
+                self.send_response(status)
+                for k, v in headers:
+                    self.send_header(k, v)
+                self.send_header('Content-Length', str(len(body)))
+                self.end_headers()
+                self.wfile.write(body)
+
+            def authorised(self):
+                if self.headers.get('Authorization') == f'Bearer {BLOB_TOKEN}':
+                    return True
+                self.reply(403, b'{"error": {"code": "forbidden"}}')
+                return False
+
+            def do_GET(self):
+                if not self.authorised():
+                    return
+                path = urllib.parse.unquote(urllib.parse.urlparse(self.path).path[1:])
+                if path not in fake.files:
+                    return self.reply(404)
+                tag = fake.etag(path)
+                if self.headers.get('If-None-Match') == tag:
+                    return self.reply(304, headers=[('ETag', tag)])
+                self.reply(200, fake.files[path], [('ETag', tag)])
+
+            def do_PUT(self):
+                if not self.authorised():
+                    return
+                path = urllib.parse.parse_qs(urllib.parse.urlparse(self.path).query)['pathname'][0]
+                data = self.rfile.read(int(self.headers['Content-Length']))
+                if fake.before_put and path == demo_sync.DB_BLOB:
+                    hook, fake.before_put = fake.before_put, None
+                    hook()
+                want = self.headers.get('x-if-match')
+                if want and (path not in fake.files or fake.etag(path) != want):
+                    return self.reply(412, b'{"error": {"code": "precondition_failed"}}')
+                fake.files[path] = data
+                self.reply(200, json.dumps({'pathname': path, 'etag': fake.etag(path)}).encode())
+
+            def do_POST(self):
+                if not self.authorised():
+                    return
+                for url in json.loads(self.rfile.read(int(self.headers['Content-Length'])))['urls']:
+                    fake.files.pop(urllib.parse.unquote(urllib.parse.urlparse(url).path[1:]), None)
+                self.reply(200, b'{}')
+
+        self.httpd = ThreadingHTTPServer(('127.0.0.1', 0), H)
+        threading.Thread(target=self.httpd.serve_forever, daemon=True).start()
+        self.url = f'http://127.0.0.1:{self.httpd.server_address[1]}'
+
+    def etag(self, path):
+        return '"%s"' % hashlib.sha1(self.files[path]).hexdigest()
+
+    def store(self):
+        return RealBlobStore(BLOB_TOKEN, self.url, self.url)
+
+    def stop(self):
+        self.httpd.shutdown()
+        self.httpd.server_close()
+
+
+def read_setting(path, key):
+    return demo_sync._read_setting(path, key)
+
+
+def write_setting(path, key, value):
+    conn = sqlite3.connect(path)
+    conn.execute('UPDATE settings SET value = ? WHERE key = ?', (value, key))
+    conn.commit()
+    conn.close()
+
+
+class SharedDemoTests(unittest.TestCase):
+    """Every copy of the hosted demo works on one database kept in Vercel Blob (demo_sync)."""
+
+    def setUp(self):
+        self.tmp = tempfile.mkdtemp()
+        self.saved = dict(server.CONFIG)
+        self.blob = FakeBlob()
+        os.environ.update(SHIFTTABLE_SECRET='test-secret', SHIFTTABLE_DATA_DIR=os.path.join(self.tmp, 'a'),
+                          BLOB_READ_WRITE_TOKEN=BLOB_TOKEN)
+        with mock.patch.object(demo_sync, 'BlobStore', lambda token: self.blob.store()):
+            server.serverless_setup()
+        self.httpd = ThreadingHTTPServer(('127.0.0.1', 0), server.Handler)
+        threading.Thread(target=self.httpd.serve_forever, daemon=True).start()
+        self.base = f'http://127.0.0.1:{self.httpd.server_address[1]}'
+
+    def tearDown(self):
+        self.httpd.shutdown()
+        self.httpd.server_close()
+        self.blob.stop()
+        server.SYNC = None
+        server.CONFIG.clear()
+        server.CONFIG.update(self.saved)
+        for k in ('SHIFTTABLE_SECRET', 'SHIFTTABLE_DATA_DIR', 'BLOB_READ_WRITE_TOKEN'):
+            os.environ.pop(k, None)
+        shutil.rmtree(self.tmp, ignore_errors=True)
+
+    def admin(self):
+        c = Client(self.base)
+        c.login('admin', PW['admin'])
+        return c
+
+    def other_copy(self, name='b'):
+        """Another copy of the app on the same store, with its own files."""
+        folder = os.path.join(self.tmp, name)
+        os.makedirs(folder, exist_ok=True)
+        copy = demo_sync.DemoSync(self.blob.store(), os.path.join(folder, 'roster.db'), os.path.join(folder, 'backups'), seed=lambda: None)
+        copy.pull()
+        return copy
+
+    def test_copies_share_one_demo(self):
+        self.assertIn(demo_sync.DB_BLOB, self.blob.files)  # the first copy shared the demo it seeded
+        c = self.admin()
+        self.assertEqual(c.call('POST', '/api/data/sample', {'industry': 'wellness'})[0], 200)
+        self.assertEqual(c.headers['X-Demo-Sync'], 'saved')
+        self.assertIn(f'{demo_sync.COOKIE}={server.SYNC.version}', c.headers['Set-Cookie'])
+        b = self.other_copy()
+        self.assertEqual(read_setting(b.db_path, 'business_name'), 'Vitality Wellness')
+        # another copy saves a change: a visitor who has seen it gets it here straight away
+        write_setting(b.db_path, 'business_name', 'Changed elsewhere')
+        self.assertEqual(b.after(), 'saved')
+        session = next(f'{k.name}={k.value}' for k in c.jar if k.name == server.COOKIE)
+        req = urllib.request.Request(self.base + '/api/public', headers={'Cookie': f'{session}; {demo_sync.COOKIE}={b.version}'})
+        with urllib.request.urlopen(req) as r:
+            self.assertEqual(r.headers['X-Demo-Sync'], 'pulled')
+            self.assertEqual(json.loads(r.read())['business_name'], 'Changed elsewhere')
+        # reading changes nothing, so it uploads nothing
+        uploaded = self.blob.files[demo_sync.DB_BLOB]
+        self.assertEqual(c.call('GET', '/api/roster')[0], 200)
+        self.assertIs(self.blob.files[demo_sync.DB_BLOB], uploaded)
+
+    def test_a_new_copy_joins_without_uploading(self):
+        shared = self.blob.files[demo_sync.DB_BLOB]
+        os.environ['SHIFTTABLE_DATA_DIR'] = os.path.join(self.tmp, 'late')
+        with mock.patch.object(demo_sync, 'BlobStore', lambda token: self.blob.store()):
+            server.serverless_setup()
+        self.assertIs(self.blob.files[demo_sync.DB_BLOB], shared)
+        self.assertEqual(server.SYNC.etag, self.blob.etag(demo_sync.DB_BLOB))
+
+    def test_a_save_that_loses_the_race_runs_again_on_the_newer_data(self):
+        c = self.admin()
+        b = self.other_copy()
+        write_setting(b.db_path, 'business_name', 'Saved first')
+        self.blob.before_put = b.after  # the other copy saves while this one is uploading
+        st, r = c.call('POST', '/api/branches', {'name': 'Jewel Changi', 'code': 'JC', 'color': '#123456'})
+        self.assertEqual(st, 200, r)
+        final = self.other_copy('c')
+        self.assertEqual(read_setting(final.db_path, 'business_name'), 'Saved first')
+        conn = sqlite3.connect(final.db_path)
+        self.assertEqual(conn.execute("SELECT COUNT(*) FROM branches WHERE name = 'Jewel Changi'").fetchone()[0], 1)
+        conn.close()
+
+    def test_snapshots_are_shared(self):
+        c = self.admin()
+        name = c.call('POST', '/api/data/backups', {})[1]['name']
+        b = self.other_copy()
+        self.assertEqual(os.listdir(b.backups), [name])
+        bundle = read_setting(b.db_path, '_demo_backups')
+        self.assertIn(bundle, self.blob.files)
+        self.assertEqual(c.call('DELETE', f'/api/data/backups/{name}')[0], 200)
+        self.assertNotIn(bundle, self.blob.files)  # the old zip is cleaned up
+        b.pull()
+        self.assertEqual(os.listdir(b.backups), [])
+
+    def test_an_idle_demo_is_seeded_afresh(self):
+        c = self.admin()
+        self.assertEqual(c.call('POST', '/api/data/sample', {'industry': 'manufacturing'})[0], 200)
+        b = self.other_copy()
+        write_setting(b.db_path, '_demo_changed_at', repr(time.time() - demo_sync.IDLE_RESET - 60))
+        with open(b.db_path, 'rb') as f:
+            self.blob.files[demo_sync.DB_BLOB] = zlib.compress(f.read())
+        server.SYNC.checked = 0  # as if this copy last checked long ago
+        self.assertEqual(c.call('GET', '/api/public')[1]['business_name'], 'Harbour Lane Group')
+        self.assertEqual(c.headers['X-Demo-Sync'], 'reset')
+        self.assertEqual(c.call('GET', '/api/bootstrap')[0], 200)  # still signed in
+        self.assertEqual(read_setting(self.other_copy('c').db_path, 'business_name'), 'Harbour Lane Group')
+
+    def test_demo_logins_stay_usable(self):
+        admin, mgr = self.admin(), Client(self.base)
+        mgr.login('manager', PW['manager'])
+        self.assertEqual(mgr.call('POST', '/api/me/password', {'current': PW['manager'], 'new': 'Brand-new-1'})[0], 400)
+        mid = next(u['id'] for u in admin.call('GET', '/api/users')[1] if u['username'] == 'manager')
+        self.assertEqual(admin.call('POST', f'/api/users/{mid}/password', {'password': 'Brand-new-1'})[0], 400)
+        self.assertEqual(admin.call('PUT', f'/api/users/{mid}', {'display_name': 'X', 'role': 'staff', 'active': 0})[0], 400)
+        self.assertEqual(admin.call('DELETE', f'/api/users/{mid}')[0], 400)
+        admin.call('PUT', '/api/settings', {'show_demo_logins': False})
+        self.assertTrue(Client(self.base).call('GET', '/api/public')[1]['demo_logins'])
+        # visitors can still try logins of their own
+        st, u = admin.call('POST', '/api/users', {'username': 'visitor', 'display_name': 'Visitor', 'role': 'manager', 'password': 'Visitor#2026'})
+        self.assertEqual(st, 200, u)
+        self.assertEqual(admin.call('POST', f"/api/users/{u['id']}/password", {'password': 'Visitor#2027'})[0], 200)
+        # and a doctored backup can't lock anyone out
+        doc = admin.call('GET', '/api/data/export?format=json')[1]
+        for u in doc['tables']['users']:
+            if u['username'] == 'manager':
+                u['password_hash'] = server.hash_password('Only-I-know-this-1')
+        for s in doc['tables']['settings']:
+            if s['key'] == 'show_demo_logins':
+                s['value'] = '0'
+        st, r = admin.call('POST', '/api/data/restore', {'filename': 'x.json', 'content': base64.b64encode(json.dumps(doc).encode()).decode()})
+        self.assertEqual(st, 200, r)
+        Client(self.base).login('manager', PW['manager'])
+        self.assertTrue(Client(self.base).call('GET', '/api/public')[1]['demo_logins'])
+
+    def test_the_demo_keeps_working_when_the_store_is_unreachable(self):
+        c = self.admin()
+        self.blob.stop()
+        server.SYNC.checked = 0
+        st, r = c.call('POST', '/api/branches', {'name': 'Offline', 'code': 'OFF', 'color': '#123456'})
+        self.assertEqual((st, c.headers['X-Demo-Sync']), (200, 'offline'), r)
+        self.assertEqual(c.call('GET', '/api/bootstrap')[0], 200)
 
 
 if __name__ == '__main__':

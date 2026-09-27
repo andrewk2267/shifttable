@@ -34,6 +34,7 @@ from http.cookies import SimpleCookie
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from urllib.parse import parse_qs, urlparse
 
+import demo_sync
 import rules
 import sample_data
 
@@ -375,9 +376,9 @@ def q_range(req, limit=92):
 
 # ---------------------------------------------------------------- passwords and sessions
 
-def hash_password(pw, iterations=None, salt=None):
+def hash_password(pw, iterations=None):
     it = iterations or PBKDF2_ITER
-    salt = salt or secrets.token_bytes(16)
+    salt = secrets.token_bytes(16)
     dk = hashlib.pbkdf2_hmac('sha256', pw.encode(), salt, it)
     return f'pbkdf2_sha256${it}${salt.hex()}${dk.hex()}'
 
@@ -471,6 +472,28 @@ def read_session_token(conn, token):
 def end_all_sessions(conn):
     conn.execute("INSERT INTO settings (key, value) VALUES ('_session_epoch', ?) ON CONFLICT(key) DO UPDATE SET value = excluded.value",
                  (secrets.token_hex(8),))
+
+
+DEMO_USERNAMES = {u for u, *_ in sample_data.DEMO_USERS}
+
+
+def ensure_demo_logins(conn):
+    """Create the demo logins, or put them back as they should be (the hosted demo does
+    this after every restore, so nobody can lock other visitors out)."""
+    for username, password, display, role, _label in sample_data.DEMO_USERS:
+        u = one(conn, 'SELECT id FROM users WHERE username = ?', (username,))
+        if u:
+            conn.execute('UPDATE users SET password_hash = ?, role = ?, active = 1 WHERE id = ?', (hash_password(password), role, u['id']))
+            continue
+        emp = one(conn, 'SELECT id FROM employees WHERE name = ?', (display,))
+        conn.execute('INSERT INTO users (username, display_name, password_hash, role, employee_id, active, created_at) VALUES (?,?,?,?,?,1,?)',
+                     (username, display, hash_password(password), role, emp['id'] if emp else None, now_iso()))
+    set_setting(conn, 'show_demo_logins', 1)
+
+
+def guard_demo_login(username):
+    if CONFIG['demo'] and username in DEMO_USERNAMES:
+        raise ApiError(400, "The demo logins can't be changed on the live demo. Add a login of your own to try this.")
 
 
 def validate_password(pw):
@@ -656,6 +679,7 @@ def api_me_password(req):
     current = str(req.body.get('current', ''))
     new = str(req.body.get('new', ''))
     u = one(conn, 'SELECT * FROM users WHERE id = ?', (req.user['id'],))
+    guard_demo_login(u['username'])
     if not verify_password(current, u['password_hash']):
         raise ApiError(400, 'Your current password is not correct.')
     validate_password(new)
@@ -700,7 +724,7 @@ def api_settings(req):
         if kind == 'str':
             v = v_str(req.body, key, key.replace('_', ' ').capitalize(), maxlen=hi, required=True)
         elif kind == 'bool':
-            v = 1 if req.body[key] in (True, 1, '1', 'true') else 0
+            v = 1 if req.body[key] in (True, 1, '1', 'true') or (key == 'show_demo_logins' and CONFIG['demo']) else 0
         else:
             v = v_num(req.body, key, key.replace('_', ' ').capitalize(), lo, hi, integer=(kind == 'int'))
         set_setting(req.conn, key, v)
@@ -1665,6 +1689,7 @@ def api_user_create(req):
 def api_user_update(req):
     conn = req.conn
     uid = v_id(conn, 'users', req.params[0], 'User')
+    guard_demo_login(one(conn, 'SELECT username FROM users WHERE id = ?', (uid,))['username'])
     f = user_body(conn, req.body)
     if uid == req.user['id'] and (f['role'] != 'admin' or not f['active']):
         raise ApiError(400, "You can't remove your own admin access or deactivate yourself.")
@@ -1679,6 +1704,7 @@ def api_user_update(req):
 def api_user_password(req):
     conn = req.conn
     uid = v_id(conn, 'users', req.params[0], 'User')
+    guard_demo_login(one(conn, 'SELECT username FROM users WHERE id = ?', (uid,))['username'])
     pw = str(req.body.get('password', ''))
     validate_password(pw)
     conn.execute('UPDATE users SET password_hash = ? WHERE id = ?', (hash_password(pw), uid))
@@ -1696,6 +1722,7 @@ def api_user_delete(req):
     if uid == req.user['id']:
         raise ApiError(400, "You can't delete your own login.")
     u = one(conn, 'SELECT * FROM users WHERE id = ?', (uid,))
+    guard_demo_login(u['username'])
     if u['role'] == 'admin' and not active_admins(conn, exclude=uid):
         raise ApiError(400, 'There must be at least one active admin.')
     conn.execute('DELETE FROM users WHERE id = ?', (uid,))
@@ -1722,7 +1749,7 @@ def snapshot(conn, reason):
     finally:
         dst.close()
     autos = sorted(f for f in os.listdir(CONFIG['backups']) if SNAP_RE.match(f) and '-manual' not in f)
-    for old in autos[:-20]:
+    for old in autos[:-(5 if CONFIG['demo'] else 20)]:  # the hosted demo shares its snapshots, so keeps fewer
         os.remove(os.path.join(CONFIG['backups'], old))
     return name
 
@@ -1806,6 +1833,8 @@ def restore_from_db_file(conn, path):
     conn.commit()
     migrate(conn)
     end_all_sessions(conn)
+    if CONFIG['demo']:
+        ensure_demo_logins(conn)
 
 
 def restore_from_json(conn, data):
@@ -1843,6 +1872,8 @@ def restore_from_json(conn, data):
     ensure_settings(conn)
     ensure_branch_defaults(conn)
     end_all_sessions(conn)
+    if CONFIG['demo']:
+        ensure_demo_logins(conn)
 
 
 def decode_upload(b):
@@ -2401,13 +2432,7 @@ def init_db(seed=True):
         migrate(conn)
         if seed and not conn.execute('SELECT COUNT(*) FROM users').fetchone()[0]:
             sample_data.load(conn, today(), load_ctx, keep_users=False, industry='fnb', now=local_now())
-            for username, password, display, role, _label in sample_data.DEMO_USERS:
-                emp = one(conn, 'SELECT id FROM employees WHERE name = ?', (display,))
-                # In the hosted demo every copy of the app seeds the same hashes, so a
-                # signed session from one copy is valid on the others.
-                salt = hashlib.sha256(session_secret(conn) + username.encode()).digest()[:16] if CONFIG['demo'] else None
-                conn.execute('INSERT INTO users (username, display_name, password_hash, role, employee_id, active, created_at) VALUES (?,?,?,?,?,1,?)',
-                             (username, display, hash_password(password, salt=salt), role, emp['id'] if emp else None, now_iso()))
+            ensure_demo_logins(conn)
             audit(conn, None, 'data.seeded', 'Demo business and demo logins created')
         if has_data and version < SCHEMA_VERSION:
             audit(conn, None, 'data.upgraded', f'Database upgraded from version {version} to {SCHEMA_VERSION}')
@@ -2434,10 +2459,14 @@ def index_csp(html):
     return _csp_cache[key]
 
 
+SYNC = None  # the hosted demo's shared database (demo_sync.DemoSync), when a Blob store is connected
+
+
 class Handler(BaseHTTPRequestHandler):
     server_version = 'ShiftTable'
     sys_version = ''
     protocol_version = 'HTTP/1.1'
+    held = None  # responses kept back until the hosted demo has saved (see dispatch)
 
     def log_message(self, fmt, *args):
         if not os.environ.get('SHIFTTABLE_QUIET'):
@@ -2459,6 +2488,9 @@ class Handler(BaseHTTPRequestHandler):
         self.dispatch('DELETE')
 
     def send(self, status, body, ctype, extra=None):
+        if self.held is not None:
+            self.held.append((status, body, ctype, list(extra or [])))
+            return
         self.send_response(status)
         self.send_header('Content-Type', ctype)
         self.send_header('Content-Length', str(len(body)))
@@ -2488,6 +2520,51 @@ class Handler(BaseHTTPRequestHandler):
         return read_session_token(conn, c[COOKIE].value)
 
     def dispatch(self, method):
+        if SYNC is None or not urlparse(self.path).path.startswith('/api/'):
+            return self.route_request(method)
+        # Hosted demo: run the request on the shared database and answer once any change
+        # is saved. If another copy saved first, run it again on their newer data.
+        try:
+            length = int(self.headers.get('Content-Length') or 0)
+        except ValueError:
+            length = 0
+        body = self.rfile.read(length) if 0 < length <= MAX_BODY else b''
+        try:
+            c = SimpleCookie(self.headers.get('Cookie') or '')
+            seen = c[demo_sync.COOKIE].value if demo_sync.COOKIE in c else ''
+        except Exception:
+            seen = ''
+        with SYNC.lock:
+            status = SYNC.before(method, seen)
+            for _attempt in range(2):
+                self.rfile, self.held = io.BytesIO(body), []
+                self.route_request(method)
+                try:
+                    status = SYNC.after() or status
+                    break
+                except demo_sync.Conflict:
+                    status = 'retried'
+                    try:
+                        SYNC.pull()
+                    except demo_sync.BlobError as e:
+                        demo_sync.log(e)
+                except demo_sync.BlobError as e:
+                    demo_sync.log(e)
+                    status = 'offline'
+                    break
+            else:
+                status = 'busy'
+                self.held = [(409, json.dumps({'error': 'Someone else changed the demo at the same moment. Please try again.'}).encode(),
+                              'application/json; charset=utf-8', [('Cache-Control', 'no-store')])]
+            held, self.held = self.held, None
+            extra = [('X-Demo-Sync', status)]
+            cookie = SYNC.cookie(seen, self.headers.get('X-Forwarded-Proto') == 'https')
+            if cookie:
+                extra.append(('Set-Cookie', cookie))
+        for st, b, ct, ex in held:
+            self.send(st, b, ct, ex + extra)
+
+    def route_request(self, method):
         url = urlparse(self.path)
         path = url.path
         if method == 'GET' and path in ('/', '/index.html'):
@@ -2575,12 +2652,19 @@ def make_server(host, port):
 
 
 def serverless_setup():
-    """For hosts without a permanent disk (Vercel): keep the database in /tmp and seed the
-    demo business whenever a fresh copy of the app starts."""
+    """For hosts without a permanent disk (Vercel): keep the database in /tmp. With a Blob
+    store connected, every copy of the app shares one demo (see demo_sync); without one,
+    each copy seeds its own whenever it starts."""
+    global SYNC
     data_dir = os.environ.get('SHIFTTABLE_DATA_DIR', '/tmp/shifttable')
     os.makedirs(data_dir, exist_ok=True)
     CONFIG.update(db=os.path.join(data_dir, 'roster.db'), backups=os.path.join(data_dir, 'backups'), demo=True)
-    init_db()
+    token = os.environ.get('BLOB_READ_WRITE_TOKEN')
+    if token:
+        SYNC = demo_sync.DemoSync(demo_sync.BlobStore(token), CONFIG['db'], CONFIG['backups'], init_db)
+        SYNC.start()
+    else:
+        init_db()
 
 
 def main():

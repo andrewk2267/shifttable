@@ -39,18 +39,26 @@ The repository deploys to Vercel as a **live demo**:
 
 - `api/index.py` runs the same server as a Vercel Python function, and `vercel.json`
   sends every path to it.
-- Vercel functions have no permanent disk. The database lives in `/tmp` and is
-  re-created with the F&B demo whenever Vercel starts a fresh copy, so **changes don't
-  last**. It shows the product, it doesn't store real rosters.
-- When it's busy, Vercel runs several copies at once, each with its own demo database.
-  An edit then only shows while your requests reach the copy that made it.
+- Vercel runs several copies of the function at once, and none has a permanent disk.
+  Each copy works on an SQLite file in `/tmp`. `demo_sync.py` keeps all copies on
+  **one shared demo** stored in a private Vercel Blob store:
+  - Before a request, a copy fetches the shared file if it may be behind.
+  - After a change, it uploads the file. If another copy saved first, the upload is
+    refused and the request runs again on the newer data.
+  - Snapshots are shared the same way. The demo keeps the last 5 automatic ones.
+- **The demo resets itself**: after an hour without changes, the next visitor gets a
+  fresh F&B demo. It shows the product, it doesn't store real rosters.
+- The four demo logins can't be changed, deleted or hidden on the live demo, and a
+  restore puts them back, so no visitor can lock out the others.
 - For real use, run it on your own computer or a server with a disk (the instructions
-  below), or move the data to a hosted database.
-- Sign-ins are signed cookies, so they keep working when Vercel moves you between
-  copies of the app. In the demo, a restore or password change doesn't sign anyone out.
+  below).
+- Sign-ins are signed cookies, so they keep working whichever copy answers.
 - Environment variables:
   - `SHIFTTABLE_SECRET` (a long random string that signs sign-in cookies)
   - `SHIFTTABLE_UTC_OFFSET` (`8` for Singapore time; Vercel servers run on UTC)
+  - `BLOB_READ_WRITE_TOKEN` (set by Vercel when a Blob store is connected to the
+    project). Without it, each copy keeps its own demo that resets whenever the copy
+    restarts.
 - The function runs in Vercel's Singapore region (`sin1`).
 
 ## Demo logins
@@ -222,7 +230,7 @@ cd ShiftTable
 python3 -m unittest discover -s tests -v
 ```
 
-The 54 tests cover:
+The 61 tests cover:
 - **The rule engine**: every labour rule, cross-branch limits, branch setup, holiday pay,
   closures, coverage, auto-fill fairness and home-branch preference, clock-record
   matching, and a 30-person two-branch week.
@@ -233,6 +241,9 @@ The 54 tests cover:
   sample businesses, and upgrading a first-version database and backup.
 - **Hosting**: signed sign-in cookies (tampering, expiry, sharing across demo copies),
   the Vercel entry point and the business clock offset.
+- **The shared demo**, against a stand-in Blob service: copies sharing changes and
+  snapshots, a save that loses a race, the idle reset, protected demo logins, and
+  carrying on when the store is unreachable.
 
 They use temporary databases and never touch `roster.db`.
 
