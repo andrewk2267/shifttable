@@ -9,13 +9,13 @@ its SQLite file in one private Vercel Blob store:
 - After a request that changed anything, it uploads the file on condition that nobody
   saved since it fetched. If another copy got there first, the upload is refused; the
   caller fetches the newer file and runs the request again on it.
-- Snapshots travel as one zip, uploaded only when they change.
+- Each snapshot is uploaded once, and the database lists the shared ones, so
+  another copy downloads only the snapshots it lacks.
 - A demo nobody has changed for an hour is seeded afresh for the next visitor.
 
 Standard library only: the Blob calls are plain HTTPS requests.
 """
 import hashlib
-import io
 import json
 import os
 import re
@@ -27,7 +27,6 @@ import time
 import urllib.error
 import urllib.parse
 import urllib.request
-import zipfile
 import zlib
 
 DB_BLOB = 'shifttable/roster.db.z'
@@ -126,9 +125,8 @@ class DemoSync:
         self.lock = threading.RLock()
         self.known = False   # reached the store at least once, so etag is trustworthy
         self.etag = None     # the shared file's ETag that the local file matches (None: nothing shared yet)
-        self.digest = None   # sha256 of the local file when it last matched the shared one
-        self.bundle = ''     # the shared snapshot zip that the local backups folder matches
-        self.snaps = []      # the local snapshots at that point, as (name, size)
+        self.digest = None   # fingerprint of the local file when it last matched the shared one
+        self.snaps = {}      # the shared snapshots, which the backups folder matches: name -> blob pathname
         self.checked = 0.0
 
     @property
@@ -164,13 +162,15 @@ class DemoSync:
         """Share the local file if the request changed it. Raises Conflict if another copy saved first."""
         if not self.known:
             return None
-        snaps = self._local_snaps()
-        if self._digest() == self.digest and snaps == self.snaps:
+        names = self._local_names()
+        if self._digest() == self.digest and names == sorted(self.snaps):
             return None
-        bundle = self.bundle if snaps == self.snaps else self._push_snapshots(snaps)
+        snaps = {n: self.snaps[n] for n in names if n in self.snaps}
+        added = [self._push_snapshot(n) for n in names if n not in snaps]  # before the file that lists them
+        snaps.update(added)
         conn = sqlite3.connect(self.db_path)
         try:
-            for key, value in (('_demo_backups', bundle), ('_demo_changed_at', repr(time.time()))):
+            for key, value in (('_demo_backups', json.dumps(snaps, sort_keys=True)), ('_demo_changed_at', repr(time.time()))):
                 conn.execute('INSERT INTO settings (key, value) VALUES (?, ?) ON CONFLICT(key) DO UPDATE SET value = excluded.value',
                              (key, value))
             conn.commit()
@@ -181,14 +181,12 @@ class DemoSync:
         try:
             etag = self.store.put(DB_BLOB, zlib.compress(raw, 6), self.etag)
         except Conflict:
-            if bundle != self.bundle:
-                self._forget(bundle)
+            self._forget([p for _n, p in added])
             raise
-        old = self.bundle
-        self.etag, self.digest, self.bundle, self.snaps = etag, _fingerprint(raw), bundle, snaps
+        gone = [p for n, p in self.snaps.items() if n not in snaps]
+        self.etag, self.digest, self.snaps = etag, _fingerprint(raw), snaps
         self.checked = time.monotonic()
-        if old and old != bundle:
-            self._forget(old)
+        self._forget(gone)
         return 'saved'
 
     def save_quietly(self):
@@ -214,20 +212,24 @@ class DemoSync:
         with open(tmp, 'wb') as f:
             f.write(raw)
         try:
-            bundle = _read_setting(tmp, '_demo_backups') or ''
-            files = self._fetch_snapshots(bundle) if bundle != self.bundle else None
+            try:
+                snaps = json.loads(_read_setting(tmp, '_demo_backups') or '{}')
+            except ValueError:
+                snaps = {}
+            local = set(self._local_names())
+            fetched = {n: self._fetch_snapshot(p) for n, p in snaps.items()
+                       if SNAP_RE.match(n) and (n not in local or self.snaps.get(n) != p)}
             os.replace(tmp, self.db_path)
         finally:
             if os.path.exists(tmp):
                 os.remove(tmp)
-        if files is not None:
-            shutil.rmtree(self.backups, ignore_errors=True)
-            os.makedirs(self.backups, exist_ok=True)
-            for name, content in files.items():
-                with open(os.path.join(self.backups, name), 'wb') as f:
-                    f.write(content)
-            self.bundle, self.snaps = bundle, self._local_snaps()
-        self.etag, self.digest = etag, _fingerprint(raw)
+        os.makedirs(self.backups, exist_ok=True)
+        for n in local - set(snaps):
+            os.remove(os.path.join(self.backups, n))
+        for n, content in fetched.items():
+            with open(os.path.join(self.backups, n), 'wb') as f:
+                f.write(content)
+        self.etag, self.digest, self.snaps = etag, _fingerprint(raw), snaps
         return 'pulled'
 
     def reset(self):
@@ -258,40 +260,35 @@ class DemoSync:
         except FileNotFoundError:
             return None
 
-    def _local_snaps(self):
+    def _local_names(self):
         try:
-            return sorted((n, os.path.getsize(os.path.join(self.backups, n))) for n in os.listdir(self.backups) if SNAP_RE.match(n))
+            return sorted(n for n in os.listdir(self.backups) if SNAP_RE.match(n))
         except FileNotFoundError:
             return []
 
-    def _push_snapshots(self, snaps):
-        if not snaps:
-            return ''
-        buf = io.BytesIO()
-        with zipfile.ZipFile(buf, 'w', zipfile.ZIP_DEFLATED) as z:
-            for name, _size in snaps:
-                z.write(os.path.join(self.backups, name), name)
-        data = buf.getvalue()
-        pathname = f'shifttable/backups-{hashlib.sha256(data).hexdigest()[:16]}.zip'
+    def _push_snapshot(self, name):
+        """Upload one snapshot, under a path unique to its content. Returns (name, pathname)."""
+        with open(os.path.join(self.backups, name), 'rb') as f:
+            data = zlib.compress(f.read(), 6)
+        pathname = f'shifttable/backups/{name}.{hashlib.sha256(data).hexdigest()[:12]}.z'
         self.store.put(pathname, data)
-        return pathname
+        return name, pathname
 
-    def _fetch_snapshots(self, bundle):
-        if not bundle:
-            return {}
-        _etag, data = self.store.get(bundle)
-        if data is None:
-            log(f'snapshot bundle {bundle} is missing')
-            return {}
-        with zipfile.ZipFile(io.BytesIO(data)) as z:
-            return {n: z.read(n) for n in z.namelist() if SNAP_RE.match(n)}
+    def _fetch_snapshot(self, pathname):
+        _etag, data = self.store.get(pathname)
+        if data is None:  # not uploaded yet, or just replaced: the next pull tries again
+            raise BlobError(f'snapshot {pathname} is missing')
+        return zlib.decompress(data)
 
-    def _forget(self, pathname):
-        """Delete an unused snapshot zip in the background: nothing waits on it, and a
-        leftover zip does no harm."""
+    def _forget(self, pathnames):
+        """Delete unused snapshots in the background: nothing waits on it, and a leftover
+        file does no harm."""
+        if not pathnames:
+            return
+
         def delete():
             try:
-                self.store.delete([pathname])
+                self.store.delete(pathnames)
             except BlobError as e:
                 log(e)
         threading.Thread(target=delete, daemon=True).start()

@@ -1060,6 +1060,7 @@ class FakeBlob:
 
     def __init__(self):
         self.files = {}
+        self.puts = []  # pathnames uploaded, in order
         self.before_put = None  # run once as the shared database's next upload arrives
         fake = self
 
@@ -1104,6 +1105,7 @@ class FakeBlob:
                 if want and (path not in fake.files or fake.etag(path) != want):
                     return self.reply(412, b'{"error": {"code": "precondition_failed"}}')
                 fake.files[path] = data
+                fake.puts.append(path)
                 self.reply(200, json.dumps({'pathname': path, 'etag': fake.etag(path)}).encode())
 
             def do_POST(self):
@@ -1225,16 +1227,22 @@ class SharedDemoTests(unittest.TestCase):
         name = c.call('POST', '/api/data/backups', {})[1]['name']
         b = self.other_copy()
         self.assertEqual(os.listdir(b.backups), [name])
-        bundle = read_setting(b.db_path, '_demo_backups')
-        self.assertIn(bundle, self.blob.files)
+        path = json.loads(read_setting(b.db_path, '_demo_backups'))[name]
+        self.assertIn(path, self.blob.files)
+        # a second snapshot uploads only itself, and the other copy downloads only it
+        self.blob.puts.clear()
+        second = c.call('POST', '/api/data/backups', {})[1]['name']
+        self.assertEqual([p for p in self.blob.puts if p != demo_sync.DB_BLOB], [json.loads(read_setting(server.CONFIG['db'], '_demo_backups'))[second]])
+        b.pull()
+        self.assertEqual(sorted(os.listdir(b.backups)), sorted([name, second]))
         self.assertEqual(c.call('DELETE', f'/api/data/backups/{name}')[0], 200)
-        for _ in range(50):  # the old zip is cleaned up in the background
-            if bundle not in self.blob.files:
+        for _ in range(50):  # deleted in the background
+            if path not in self.blob.files:
                 break
             time.sleep(0.05)
-        self.assertNotIn(bundle, self.blob.files)
+        self.assertNotIn(path, self.blob.files)
         b.pull()
-        self.assertEqual(os.listdir(b.backups), [])
+        self.assertEqual(os.listdir(b.backups), [second])
 
     def test_an_idle_demo_is_seeded_afresh(self):
         c = self.admin()
