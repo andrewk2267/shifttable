@@ -962,7 +962,11 @@ function setHeader(title, sub, actions) {
   document.title = `${title} · ShiftTable`;
 }
 function parseHash() { const h = location.hash.replace(/^#\/?/, ''); const [name, ...rest] = h.split('/'); return { name: name || 'dashboard', arg: rest.join('/') || null }; }
-async function route() {
+// Pages render one after another, so a slow page can't draw over the one opened after it.
+let routing = Promise.resolve();
+function route() { return (routing = routing.then(renderRoute, renderRoute)); }
+
+async function renderRoute() {
   if (!state.user) return;
   const r = parseHash();
   if (!navItems().some(n => n.id === r.name)) { location.hash = '#/dashboard'; return; }
@@ -2306,13 +2310,13 @@ SETTINGS.data = async el => {
   const c = stats.counts;
   const kb = b => b > 1048576 ? `${(b / 1048576).toFixed(1)} MB` : `${Math.max(1, Math.round(b / 1024))} KB`;
   setHTML(el, html`<div class="stack" style="max-width:920px">
-    <div class="card card-pad"><div class="row"><span class="avatar" style="--pos:var(--accent)">${icon('db')}</span><div style="flex:1"><h2>Database</h2><p class="small muted"><span class="code">${stats.db_file}</span> · ${kb(stats.db_bytes)} · stored next to server.py</p></div></div>
+    <div class="card card-pad"><div class="row"><span class="avatar" style="--pos:var(--accent)">${icon('db')}</span><div style="flex:1"><h2>Database</h2><p class="small muted"><span class="code">${stats.db_file}</span> · ${kb(stats.db_bytes)} · ${state.demo ? 'shared by every visitor to the live demo' : 'stored next to server.py'}</p></div></div>
       <div class="grid-3" style="margin-top:14px;grid-template-columns:repeat(auto-fit,minmax(110px,1fr))">${[['Branches', c.branches], ['Team members', c.employees], ['Shifts', c.shifts], ['Clock records', c.attendance], ['Holidays & events', c.calendar_events], ['Requests', c.leave_requests + c.shift_requests], ['Logins', c.users]].map(([l, n]) => html`<div><div class="small faint">${l}</div><div style="font-size:18px;font-weight:680" class="tabular">${n.toLocaleString()}</div></div>`)}</div></div>
 
     <div class="card"><div class="card-head"><div style="flex:1"><h2>Back up</h2><p>Download a copy to keep somewhere safe, or save a snapshot on this computer.</p></div></div>
       <div class="card-body stack">
         <div class="row"><a class="btn" href="/api/data/export?format=db">${icon('download')}Download .db</a><a class="btn" href="/api/data/export?format=json">${icon('download')}Download .json</a><button class="btn btn-primary" data-action="snapshot">${icon('db')}Save snapshot now</button></div>
-        <p class="small faint">.db is a complete SQLite copy. .json is readable and portable. Both restore below. A safety snapshot is also taken automatically before every restore, import, sample load, reset or upgrade (the last 20 are kept).</p>
+        <p class="small faint">.db is a complete SQLite copy. .json is readable and portable. Both restore below. A safety snapshot is also taken automatically before every restore, import, sample load, reset or upgrade (the last ${state.demo ? 5 : 20} are kept).</p>
         <div class="table-wrap" style="border:1px solid var(--line);border-radius:var(--r)">${backups.length ? html`<table class="table"><thead><tr><th>Snapshot</th><th>Saved</th><th class="r">Size</th><th></th></tr></thead><tbody>
           ${backups.map(b => html`<tr><td class="small"><span class="code">${b.name}</span></td><td class="small muted">${fmtStamp(b.created)}</td><td class="r small tabular">${kb(b.bytes)}</td>
             <td class="r nowrap"><a class="icon-btn" href="/api/data/backups/${encodeURIComponent(b.name)}" aria-label="Download ${b.name}" title="Download">${icon('download')}</a><button class="btn btn-sm btn-ghost" data-action="restore-snapshot" data-name="${b.name}">${icon('history')}Restore</button><button class="icon-btn" data-action="delete-snapshot" data-name="${b.name}" aria-label="Delete ${b.name}" title="Delete">${icon('trash')}</button></td></tr>`)}</tbody></table>`
@@ -2361,6 +2365,7 @@ FORMS['import-preview'] = async f => {
   await busy($('button[type=submit]', f), async () => {
     const text = await file.text();
     const r = await api('POST', '/api/data/import', { type, csv: text, filename: file.name, commit: false });
+    if (!f.isConnected) return;  // the page was redrawn meanwhile
     const p = importPreview(r);
     setHTML($('#import-preview'), html`${p.view}<div class="row" style="margin-top:10px"><span class="spacer"></span><button class="btn btn-primary" data-action="import-commit" ${p.good ? '' : raw('disabled')}>${icon('upload')}Import ${plural(p.good, 'row')}</button></div>`);
     state.pendingImport = { type, csv: text, filename: file.name };

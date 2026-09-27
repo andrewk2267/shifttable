@@ -1733,6 +1733,7 @@ def api_user_delete(req):
 # ---------------------------------------------------------------- data: backup, restore, import
 
 SNAP_RE = re.compile(r'^[A-Za-z0-9._-]+\.db$')
+SNAP_TIME_RE = re.compile(r'^shifttable-(\d{8}-\d{6})-')
 
 
 def snapshot(conn, reason):
@@ -1901,7 +1902,11 @@ def api_backups(req):
     for f in os.listdir(CONFIG['backups']):
         if SNAP_RE.match(f):
             p = os.path.join(CONFIG['backups'], f)
-            out.append({'name': f, 'bytes': os.path.getsize(p), 'created': datetime.fromtimestamp(os.path.getmtime(p)).strftime('%Y-%m-%d %H:%M:%S')})
+            # The name holds the business-time moment it was taken; a file's own time can
+            # be a copy's unpacking time in the hosted demo, and UTC on cloud hosts.
+            m = SNAP_TIME_RE.match(f)
+            created = datetime.strptime(m.group(1), '%Y%m%d-%H%M%S') if m else datetime.fromtimestamp(os.path.getmtime(p))
+            out.append({'name': f, 'bytes': os.path.getsize(p), 'created': created.strftime('%Y-%m-%d %H:%M:%S')})
     return sorted(out, key=lambda r: r['name'], reverse=True)
 
 
