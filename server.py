@@ -24,6 +24,7 @@ import re
 import secrets
 import socket
 import sqlite3
+import sys
 import tempfile
 import threading
 import time
@@ -44,10 +45,11 @@ CONFIG = {
     'backups': os.path.join(APP_DIR, 'backups'),
     'index': os.path.join(APP_DIR, 'index.html'),
     'demo': False,
+    'trust_proxy': False,  # take the visitor's address from X-Forwarded-For (only behind a host that sets it)
+    'max_body': 25 * 1024 * 1024,  # largest request accepted; uploads (restores, CSVs) travel inside one
 }
 SCHEMA_VERSION = 2
 SESSION_HOURS = 12
-MAX_BODY = 25 * 1024 * 1024
 COOKIE = 'st_session'
 CSRF_HEADER = 'X-ShiftTable'
 PBKDF2_ITER = int(os.environ.get('SHIFTTABLE_PBKDF2_ITER', '200000'))
@@ -134,6 +136,7 @@ TABLES_SQL = [
       source TEXT NOT NULL DEFAULT '', created_at TEXT NOT NULL)""",
     """CREATE TABLE IF NOT EXISTS audit_log (
       id INTEGER PRIMARY KEY, ts TEXT NOT NULL, user_id INTEGER, username TEXT, action TEXT NOT NULL, detail TEXT NOT NULL DEFAULT '')""",
+    "CREATE TABLE IF NOT EXISTS login_failures (key TEXT NOT NULL, ts REAL NOT NULL)",
 ]
 INDEXES_SQL = [
     'CREATE INDEX IF NOT EXISTS idx_shifts_date ON shifts(date)',
@@ -143,9 +146,11 @@ INDEXES_SQL = [
     'CREATE INDEX IF NOT EXISTS idx_att_date ON attendance(date)',
     'CREATE INDEX IF NOT EXISTS idx_events_date ON calendar_events(start_date, end_date)',
     'CREATE INDEX IF NOT EXISTS idx_audit_ts ON audit_log(ts)',
+    'CREATE INDEX IF NOT EXISTS idx_login_failures ON login_failures(key, ts)',
 ]
 
-# Tables in insert order (parents first). Sessions are never backed up.
+# Tables in insert order (parents first). Sign-in failures (login_failures) are left out of
+# backups and downloads.
 TABLES = ['settings', 'branches', 'positions', 'employees', 'employee_skills', 'employee_branches', 'availability',
           'shift_templates', 'staffing_needs', 'shifts', 'forecasts', 'calendar_events', 'leave_requests', 'shift_requests',
           'attendance', 'users', 'audit_log']
@@ -395,27 +400,33 @@ def verify_password(pw, stored):
 
 
 DUMMY_HASH = hash_password('not-a-real-password')
-_fails = {}
-_fails_lock = threading.Lock()
+
+# Failed sign-ins are counted per username from one address, so a stranger can't lock out
+# the real user, plus a higher ceiling per username against guessing from many addresses.
+# They're kept in the database, so every copy of a hosted app shares them.
 LOCK_ATTEMPTS, LOCK_SECONDS = 5, 900
+USER_ATTEMPTS = 50
 
 
-def throttled(key):
-    with _fails_lock:
-        now = time.time()
-        recent = [t for t in _fails.get(key, []) if now - t < LOCK_SECONDS]
-        _fails[key] = recent
-        return len(recent) >= LOCK_ATTEMPTS
+def _fail_keys(username, ip):
+    name = username.lower()
+    return ((f'ip:{ip} user:{name}', LOCK_ATTEMPTS), (f'user:{name}', USER_ATTEMPTS))
 
 
-def record_fail(key):
-    with _fails_lock:
-        _fails.setdefault(key, []).append(time.time())
+def throttled(conn, username, ip):
+    since = time.time() - LOCK_SECONDS
+    return any(conn.execute('SELECT COUNT(*) FROM login_failures WHERE key = ? AND ts > ?', (key, since)).fetchone()[0] >= limit
+               for key, limit in _fail_keys(username, ip))
 
 
-def clear_fails(key):
-    with _fails_lock:
-        _fails.pop(key, None)
+def record_fail(conn, username, ip):
+    now = time.time()
+    conn.execute('DELETE FROM login_failures WHERE ts <= ?', (now - LOCK_SECONDS,))
+    conn.executemany('INSERT INTO login_failures (key, ts) VALUES (?, ?)', [(key, now) for key, _limit in _fail_keys(username, ip)])
+
+
+def clear_fails(conn, username, ip):
+    conn.execute('DELETE FROM login_failures WHERE key = ?', (_fail_keys(username, ip)[0][0],))
 
 
 # Sessions are signed cookies, not database rows, so they keep working when a cloud host
@@ -424,17 +435,25 @@ def clear_fails(key):
 # everywhere) and a session epoch (a restore signs everyone out). In the hosted demo each
 # copy has its own database, so the signature covers only what every copy shares.
 
-def session_secret(conn):
+_secret_lock = threading.Lock()
+
+
+def session_secret():
+    """The key that signs sign-in cookies: SHIFTTABLE_SECRET, or a private file next to the
+    database (roster.key). Never kept in the database, so no backup or download carries it."""
     env = os.environ.get('SHIFTTABLE_SECRET')
     if env:
         return env.encode()
-    row = conn.execute("SELECT value FROM settings WHERE key = '_session_secret'").fetchone()
-    if row:
-        return row[0].encode()
-    value = secrets.token_hex(32)
-    conn.execute("INSERT OR IGNORE INTO settings (key, value) VALUES ('_session_secret', ?)", (value,))
-    conn.commit()
-    return conn.execute("SELECT value FROM settings WHERE key = '_session_secret'").fetchone()[0].encode()
+    path = os.path.splitext(CONFIG['db'])[0] + '.key'
+    with _secret_lock:
+        try:
+            with open(path, 'rb') as f:
+                return f.read()
+        except FileNotFoundError:
+            key = secrets.token_hex(32).encode()
+            with os.fdopen(os.open(path, os.O_WRONLY | os.O_CREAT | os.O_EXCL, 0o600), 'wb') as f:
+                f.write(key)
+            return key
 
 
 def session_epoch(conn):
@@ -447,7 +466,7 @@ def sign_session(conn, user, exp):
         msg = f"demo.{user['id']}.{exp}.{user['username']}"
     else:
         msg = f"{user['id']}.{exp}.{session_epoch(conn)}.{hashlib.sha256(user['password_hash'].encode()).hexdigest()}"
-    return hmac.new(session_secret(conn), msg.encode(), hashlib.sha256).hexdigest()
+    return hmac.new(session_secret(), msg.encode(), hashlib.sha256).hexdigest()
 
 
 def make_session_token(conn, user):
@@ -643,19 +662,18 @@ def api_login(req):
     conn = req.conn
     username = str(req.body.get('username', '')).strip()[:80]
     password = str(req.body.get('password', ''))[:200]
-    key = username.lower()
     if not username or not password:
         raise ApiError(400, 'Enter your username and password.')
-    if throttled(key):
+    if throttled(conn, username, req.ip):
         raise ApiError(429, 'Too many failed attempts. Try again in 15 minutes.')
     u = one(conn, 'SELECT * FROM users WHERE username = ?', (username,))
     ok = verify_password(password, u['password_hash'] if u else DUMMY_HASH)
     if not (u and ok and u['active']):
-        record_fail(key)
+        record_fail(conn, username, req.ip)
         audit(conn, None, 'login.failed', f'username={username}')
         conn.commit()
         raise ApiError(401, 'Wrong username or password.')
-    clear_fails(key)
+    clear_fails(conn, username, req.ip)
     conn.execute('UPDATE users SET last_login_at = ? WHERE id = ?', (now_iso(), u['id']))
     audit(conn, u, 'login', '')
     req.set_session(u)
@@ -707,6 +725,7 @@ def api_bootstrap(req):
         'leave_kinds': LEAVE_KINDS,
         'today': today().isoformat(),
         'demo': CONFIG['demo'],
+        'max_upload': CONFIG['max_body'],
     }
     if req.user['employee_id'] and req.user['employee_id'] in emps and not full:
         out['me'] = emp_json(emps[req.user['employee_id']], True)
@@ -1783,6 +1802,9 @@ def export_db_bytes(conn):
         dst = sqlite3.connect(path)
         try:
             conn.backup(dst)
+            dst.execute('PRAGMA secure_delete = ON')  # sign-in failures hold visitors' addresses
+            dst.execute('DELETE FROM login_failures')
+            dst.commit()
         finally:
             dst.close()
         with open(path, 'rb') as f:
@@ -2363,6 +2385,9 @@ def api_attendance_delete(req):
 def ensure_settings(conn):
     for key, (_k, default, _lo, _hi) in SETTINGS.items():
         conn.execute('INSERT OR IGNORE INTO settings (key, value) VALUES (?, ?)', (key, str(default)))
+    # Older versions kept the sign-in key here, so it went out in every backup. It now lives
+    # outside the database (see session_secret); drop any copy, which also retires it.
+    conn.execute("DELETE FROM settings WHERE key = '_session_secret'")
 
 
 def ensure_branch_defaults(conn):
@@ -2524,6 +2549,13 @@ class Handler(BaseHTTPRequestHandler):
             return None
         return read_session_token(conn, c[COOKIE].value)
 
+    def client_ip(self):
+        if CONFIG['trust_proxy']:
+            forwarded = (self.headers.get('X-Forwarded-For') or '').split(',')[0].strip()
+            if forwarded:
+                return forwarded
+        return self.client_address[0]
+
     def dispatch(self, method):
         if SYNC is None or not urlparse(self.path).path.startswith('/api/'):
             return self.route_request(method)
@@ -2533,7 +2565,7 @@ class Handler(BaseHTTPRequestHandler):
             length = int(self.headers.get('Content-Length') or 0)
         except ValueError:
             length = 0
-        body = self.rfile.read(length) if 0 < length <= MAX_BODY else b''
+        body = self.rfile.read(length) if 0 < length <= CONFIG['max_body'] else b''
         try:
             c = SimpleCookie(self.headers.get('Cookie') or '')
             seen = c[demo_sync.COOKIE].value if demo_sync.COOKIE in c else ''
@@ -2599,8 +2631,17 @@ class Handler(BaseHTTPRequestHandler):
                 length = int(self.headers.get('Content-Length') or 0)
             except ValueError:
                 return self.send_json(400, {'error': 'Bad Content-Length.'})
-            if length > MAX_BODY:
-                return self.send_json(413, {'error': 'That upload is too large (25 MB limit).'})
+            if length > CONFIG['max_body']:
+                # Read past the body so the client can see the answer, unless it's absurdly large.
+                if length > 4 * CONFIG['max_body']:
+                    self.close_connection = True
+                    length = 0
+                while length > 0:
+                    chunk = self.rfile.read(min(length, 65536))
+                    if not chunk:
+                        break
+                    length -= len(chunk)
+                return self.send_json(413, {'error': f"That upload is too large (the limit here is {CONFIG['max_body'] / 1048576:g} MB)."})
             raw = self.rfile.read(length) if length else b''
             if raw:
                 try:
@@ -2617,7 +2658,7 @@ class Handler(BaseHTTPRequestHandler):
                 raise ApiError(401, 'Please sign in.')
             if role and RANK[user['role']] < RANK[role]:
                 raise ApiError(403, "You don't have access to that.")
-            req = Req(conn, user, params, query, body, self.client_address[0], self.headers.get('X-Forwarded-Proto') == 'https')
+            req = Req(conn, user, params, query, body, self.client_ip(), self.headers.get('X-Forwarded-Proto') == 'https')
             result = fn(req)
             conn.commit()
             extra = [('Set-Cookie', c) for c in req.cookies]
@@ -2663,7 +2704,13 @@ def serverless_setup():
     global SYNC
     data_dir = os.environ.get('SHIFTTABLE_DATA_DIR', '/tmp/shifttable')
     os.makedirs(data_dir, exist_ok=True)
-    CONFIG.update(db=os.path.join(data_dir, 'roster.db'), backups=os.path.join(data_dir, 'backups'), demo=True)
+    # Vercel replaces any X-Forwarded-For a visitor sends with their real address.
+    # Vercel caps request bodies at 4.5 MB, so uploads stop at 4 MB here.
+    CONFIG.update(db=os.path.join(data_dir, 'roster.db'), backups=os.path.join(data_dir, 'backups'), demo=True, trust_proxy=True,
+                  max_body=4 * 1024 * 1024)
+    if not os.environ.get('SHIFTTABLE_SECRET'):
+        print('SHIFTTABLE_SECRET is not set: each copy of the app will sign cookies with its own key, '
+              'so sign-ins break whenever the host moves a visitor to another copy.', file=sys.stderr, flush=True)
     token = os.environ.get('BLOB_READ_WRITE_TOKEN')
     if token:
         SYNC = demo_sync.DemoSync(demo_sync.BlobStore(token), CONFIG['db'], CONFIG['backups'], init_db)

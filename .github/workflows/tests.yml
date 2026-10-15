@@ -1,0 +1,47 @@
+name: Tests
+
+on:
+  push:
+  pull_request:
+
+jobs:
+  tests:
+    # Vercel's Deployment Checks wait for this job, by this name, before a production
+    # deployment goes live. Renaming it means updating the check in Vercel too.
+    name: Unit and browser tests
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    steps:
+      - uses: actions/checkout@v7
+      - uses: actions/setup-python@v7
+        with:
+          python-version-file: .python-version
+      - uses: actions/setup-node@v7
+        with:
+          node-version: 24
+
+      - name: Unit and API tests
+        run: python -m unittest discover -s tests -v
+
+      - name: Start a fresh server for the browser tests
+        run: |
+          mkdir -p "$RUNNER_TEMP/e2e"
+          SHIFTTABLE_QUIET=1 nohup python server.py --port 8766 --db "$RUNNER_TEMP/e2e/roster.db" > "$RUNNER_TEMP/server.log" 2>&1 &
+          for i in $(seq 1 60); do
+            curl -sf http://127.0.0.1:8766/api/public > /dev/null && exit 0
+            sleep 1
+          done
+          cat "$RUNNER_TEMP/server.log"
+          exit 1
+
+      - name: Browser tests
+        run: node tests/e2e/e2e.mjs
+        env:
+          CHROME: /usr/bin/google-chrome
+
+      - name: Keep screenshots of failed steps
+        if: failure()
+        uses: actions/upload-artifact@v7
+        with:
+          name: browser-test-screenshots
+          path: tests/e2e/shots/
