@@ -13,9 +13,12 @@ export async function launch({ port = 9333, width = 1440, height = 900 } = {}) {
   const flags = [`--remote-debugging-port=${port}`, `--user-data-dir=${profile}`, '--headless=new', '--no-first-run', '--hide-scrollbars', `--window-size=${width},${height}`];
   if (process.env.CI) flags.push('--no-sandbox');  // CI runners can't give Chrome its sandbox
   const proc = spawn(BIN, [...flags, 'about:blank'], { stdio: 'ignore' });
-  let targets;
-  for (let i = 0; i < 50; i++) { try { targets = await (await fetch(`http://127.0.0.1:${port}/json/list`)).json(); if (targets.length) break; } catch {} await sleep(100); }
-  const page = targets.find(t => t.type === 'page');
+  let page;
+  for (let i = 0; i < 300 && !page; i++) {  // up to 30 s: Chrome starts slowly on a cold CI runner
+    try { page = (await (await fetch(`http://127.0.0.1:${port}/json/list`)).json()).find(t => t.type === 'page'); } catch {}
+    if (!page) await sleep(100);
+  }
+  if (!page) { proc.kill(); throw new Error(`Chrome didn't start within 30 s (${BIN})`); }
   const ws = new WebSocket(page.webSocketDebuggerUrl);
   await new Promise(r => ws.addEventListener('open', r, { once: true }));
   let id = 0; const pending = new Map(); const logs = [];
