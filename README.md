@@ -31,6 +31,9 @@ database upgrades itself on start, after saving a safety copy in
 `backups/…-pre-upgrade-v1.db`. Existing data becomes one branch called "Main branch";
 rename it or add more branches in **Settings → Branches**.
 
+**Upgrading from a version before October 2026:** the key that signs sign-ins moves out
+of the database, because older backups carried it. Everyone signs in again once.
+
 ## Live demo on Vercel
 
 **<https://shifttable-red.vercel.app>**: sign in with any of the demo logins below.
@@ -203,6 +206,9 @@ In **Settings → Data & backup** (admin only):
 - **Save snapshot now** keeps a copy in `backups/`. A snapshot is also taken
   automatically before every restore, import, sample load, reset, clock-record delete
   or upgrade (the last 20 automatic ones are kept).
+- **Uploads** (restores and CSV imports) can be up to 25 MB on your own computer and
+  4 MB on the live demo, which is Vercel's limit. Restore files are sent encoded, so
+  backups up to 3 MB fit there.
 - **Restore** from a `.db` or `.json` file, or from a snapshot. The file is checked
   first; a file without an active admin login is refused. Backups from the first version
   are upgraded automatically. Everyone signs in again afterwards.
@@ -223,6 +229,10 @@ In **Settings → Data & backup** (admin only):
 To start completely fresh, stop the server and delete `roster.db`. It is recreated
 with the F&B demo on the next start.
 
+`roster.key`, next to `roster.db`, holds the key that signs sign-ins (on Vercel it's the
+`SHIFTTABLE_SECRET` variable instead). It's never part of a backup or download. Keep it
+private; deleting it signs everyone out.
+
 ## Tests
 
 ```bash
@@ -230,7 +240,7 @@ cd ShiftTable
 python3 -m unittest discover -s tests -v
 ```
 
-The 61 tests cover:
+The 67 tests cover:
 - **The rule engine**: every labour rule, cross-branch limits, branch setup, holiday pay,
   closures, coverage, auto-fill fairness and home-branch preference, clock-record
   matching, and a 30-person two-branch week.
@@ -240,12 +250,33 @@ The 61 tests cover:
 - **Data handling**: backup, restore and CSV/clock imports including bad files, all three
   sample businesses, and upgrading a first-version database and backup.
 - **Hosting**: signed sign-in cookies (tampering, expiry, sharing across demo copies),
-  the Vercel entry point and the business clock offset.
+  the sign-in key staying out of backups, lockouts per address, the upload limit, the
+  Vercel entry point and the business clock offset.
 - **The shared demo**, against a stand-in Blob service: copies sharing changes and
   snapshots, a save that loses a race, the idle reset, protected demo logins, and
   carrying on when the store is unreachable.
 
 They use temporary databases and never touch `roster.db`.
+
+**Browser tests** click through 65 flows in headless Chrome (Node 22 or later). They
+change data, so run them against a fresh server:
+
+```bash
+python3 server.py --port 8766 --db /tmp/shifttable-e2e/roster.db
+```
+
+Then, in another terminal:
+
+```bash
+node tests/e2e/e2e.mjs
+```
+
+Set `CHROME` to your browser's path if it isn't the standard macOS Chrome. Screenshots of
+any failed step land in `tests/e2e/shots/`.
+
+**Before deploying:** GitHub Actions runs both suites on every push
+(`.github/workflows/tests.yml`), and Vercel's Deployment Checks keep each production
+deployment off the live site until that run passes.
 
 ## Troubleshooting
 
@@ -257,5 +288,6 @@ They use temporary databases and never touch `roster.db`.
   be waiting for you to allow Python to access files on a removable volume. Look for
   the permission prompt, or allow it under System Settings → Privacy & Security →
   Files and Folders.
-- **Locked out after 5 wrong passwords**: wait 15 minutes, or restart the server.
-  Lockouts are kept in memory only.
+- **"Too many failed attempts"**: 5 wrong passwords pause sign-ins to that account from
+  that address for 15 minutes. The account still works from other devices, unless it
+  has had 50 failures from anywhere in that time.

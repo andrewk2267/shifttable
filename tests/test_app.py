@@ -4,6 +4,7 @@ Run from the ShiftTable folder:  python3 -m unittest discover -s tests -v
 """
 import base64
 import hashlib
+import hmac
 import http.cookiejar
 import json
 import os
@@ -349,7 +350,10 @@ class ApiTests(unittest.TestCase):
         for _ in range(5):
             self.assertEqual(c.call('POST', '/api/login', {'username': 'priya', 'password': 'wrong'})[0], 401)
         self.assertEqual(c.call('POST', '/api/login', {'username': 'priya', 'password': PW['priya']})[0], 429)
-        server.clear_fails('priya')
+        conn = server.db()
+        server.clear_fails(conn, 'priya', '127.0.0.1')
+        conn.commit()
+        conn.close()
         self.assertEqual(c.login('priya', PW['priya'])['role'], 'staff')
         self.assertEqual(c.call('GET', '/api/me')[1]['user']['username'], 'priya')
         self.assertEqual(c.call('POST', '/api/logout', {})[0], 200)
@@ -972,6 +976,106 @@ class SessionAndHostingTests(unittest.TestCase):
             httpd.shutdown()
             httpd.server_close()
 
+    def test_signing_key_never_travels_with_the_data(self):
+        os.environ.pop('SHIFTTABLE_SECRET', None)
+        httpd, base = start_server(self.tmp, 'k.db')
+        try:
+            c = Client(base)
+            c.login('admin', PW['admin'])
+            key_path = os.path.join(self.tmp, 'k.key')
+            with open(key_path, 'rb') as f:
+                key = f.read()
+            self.assertEqual(os.stat(key_path).st_mode & 0o777, 0o600)
+            name = c.call('POST', '/api/data/backups', {})[1]['name']
+            downloads = [c.call('GET', path, raw=True)[1] for path in
+                         ('/api/data/export?format=json', '/api/data/export?format=db', f'/api/data/backups/{name}')]
+            for blob in downloads:
+                self.assertNotIn(key, blob)
+                self.assertNotIn(b'_session_secret', blob)
+            # a backup from an older version that still carries a key can't bring it back
+            doc = json.loads(downloads[0])
+            doc['tables']['settings'].append({'key': '_session_secret', 'value': 'known-to-whoever-has-the-file'})
+            st, r = c.call('POST', '/api/data/restore', {'filename': 'old.json', 'content': base64.b64encode(json.dumps(doc).encode()).decode()})
+            self.assertEqual(st, 200, r)
+            conn = server.db()
+            self.assertIsNone(conn.execute("SELECT 1 FROM settings WHERE key = '_session_secret'").fetchone())
+            conn.close()
+        finally:
+            httpd.shutdown()
+            httpd.server_close()
+
+    def login_from(self, base, ip, user, pw):
+        req = urllib.request.Request(base + '/api/login', data=json.dumps({'username': user, 'password': pw}).encode(), method='POST',
+                                     headers={'Content-Type': 'application/json', 'X-ShiftTable': '1', 'X-Forwarded-For': ip})
+        try:
+            with urllib.request.urlopen(req) as r:
+                return r.status
+        except urllib.error.HTTPError as e:
+            return e.code
+
+    def test_failed_sign_ins_lock_out_only_that_address(self):
+        server.CONFIG['trust_proxy'] = True  # as on Vercel, which sets X-Forwarded-For itself
+        httpd, base = start_server(self.tmp, 'l.db')
+        try:
+            for _ in range(5):
+                self.assertEqual(self.login_from(base, '203.0.113.7', 'admin', 'wrong'), 401)
+            self.assertEqual(self.login_from(base, '203.0.113.7', 'admin', PW['admin']), 429)
+            self.assertEqual(self.login_from(base, '198.51.100.2', 'admin', PW['admin']), 200)  # the real admin, elsewhere
+            # guessing one account from many addresses still hits a ceiling
+            for i in range(server.USER_ATTEMPTS - 5):
+                self.login_from(base, f'192.0.2.{i}', 'admin', 'wrong')
+            self.assertEqual(self.login_from(base, '198.51.100.99', 'admin', PW['admin']), 429)
+        finally:
+            httpd.shutdown()
+            httpd.server_close()
+
+    def test_a_local_install_ignores_forwarded_addresses(self):
+        httpd, base = start_server(self.tmp, 'f.db')
+        try:
+            for i in range(5):
+                self.assertEqual(self.login_from(base, f'203.0.113.{i}', 'priya', 'wrong'), 401)
+            self.assertEqual(self.login_from(base, '203.0.113.99', 'priya', PW['priya']), 429)  # a made-up header changes nothing
+            conn = server.db()  # the count is in the database, so a restart doesn't reset it
+            self.assertTrue(server.throttled(conn, 'priya', '127.0.0.1'))
+            self.assertNotIn(b'user:priya', server.export_db_bytes(conn))  # but downloads don't carry it
+            conn.close()
+        finally:
+            httpd.shutdown()
+            httpd.server_close()
+
+    def test_upload_limit_is_enforced_and_shared_with_the_page(self):
+        server.CONFIG['max_body'] = 2 * 1048576
+        httpd, base = start_server(self.tmp, 'u.db')
+        try:
+            c = Client(base)
+            c.login('admin', PW['admin'])
+            self.assertEqual(c.call('GET', '/api/bootstrap')[1]['max_upload'], 2 * 1048576)
+            st, r = c.call('POST', '/api/data/import', {'type': 'employees', 'csv': 'x' * (2 * 1048576), 'commit': False})
+            self.assertEqual(st, 413)
+            self.assertIn('2 MB', r['error'])
+            self.assertEqual(c.call('GET', '/api/bootstrap')[0], 200)  # the next request still works
+        finally:
+            httpd.shutdown()
+            httpd.server_close()
+
+    def test_an_older_database_stops_trusting_its_stored_key(self):
+        os.environ.pop('SHIFTTABLE_SECRET', None)
+        server.CONFIG.update(db=os.path.join(self.tmp, 'old.db'), backups=os.path.join(self.tmp, 'backups'))
+        server.init_db()
+        conn = server.db()
+        conn.execute("INSERT INTO settings (key, value) VALUES ('_session_secret', 'leaked-in-a-backup')")
+        conn.commit()
+        admin = server.one(conn, "SELECT * FROM users WHERE username = 'admin'")
+        exp = int(time.time()) + 3600
+        msg = f"{admin['id']}.{exp}.{server.session_epoch(conn)}.{hashlib.sha256(admin['password_hash'].encode()).hexdigest()}"
+        forged = f"{admin['id']}.{exp}.{hmac.new(b'leaked-in-a-backup', msg.encode(), hashlib.sha256).hexdigest()}"
+        conn.close()
+        server.init_db()  # the next start
+        conn = server.db()
+        self.assertIsNone(conn.execute("SELECT 1 FROM settings WHERE key = '_session_secret'").fetchone())
+        self.assertIsNone(server.read_session_token(conn, forged))
+        conn.close()
+
     def test_hosted_demo_copies_share_logins(self):
         os.environ['SHIFTTABLE_SECRET'] = 'test-secret-for-two-copies'
         dbs = []
@@ -1015,6 +1119,8 @@ class SessionAndHostingTests(unittest.TestCase):
         spec.loader.exec_module(mod)
         self.assertTrue(issubclass(mod.handler, BaseHTTPRequestHandler))
         self.assertTrue(os.path.exists(os.path.join(self.tmp, 'vercel', 'roster.db')))
+        self.assertLessEqual(server.CONFIG['max_body'], 4.5 * 1000 * 1000)  # Vercel's request body limit
+        self.assertTrue(server.CONFIG['trust_proxy'])
         with open(os.path.join(os.path.dirname(__file__), '..', 'vercel.json')) as f:
             cfg = json.load(f)
         self.assertEqual(cfg['rewrites'][0]['destination'], '/api/index')
@@ -1283,6 +1389,14 @@ class SharedDemoTests(unittest.TestCase):
         self.assertEqual(st, 200, r)
         Client(self.base).login('manager', PW['manager'])
         self.assertTrue(Client(self.base).call('GET', '/api/public')[1]['demo_logins'])
+
+    def test_failed_sign_ins_count_on_every_copy(self):
+        c = Client(self.base)
+        for _ in range(5):
+            self.assertEqual(c.call('POST', '/api/login', {'username': 'admin', 'password': 'wrong'})[0], 401)
+        conn = sqlite3.connect(self.other_copy().db_path)
+        self.assertTrue(server.throttled(conn, 'admin', '127.0.0.1'))
+        conn.close()
 
     def test_the_demo_keeps_working_when_the_store_is_unreachable(self):
         c = self.admin()

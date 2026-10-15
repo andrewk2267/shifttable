@@ -683,6 +683,7 @@ const money2 = v => (state.settings.currency_symbol || 'S$') + (Number(v) || 0).
 const pct = v => v == null ? '–' : `${v}%`;
 const pctCls = v => v == null ? 'faint' : v > state.settings.target_labour_pct ? 'pct-warn' : 'pct-ok';
 const plural = (n, w, p) => `${n} ${n === 1 ? w : (p || w + 's')}`;
+const fmtMB = b => `${Math.round(b / 1048576 * 10) / 10} MB`;
 const initials = n => String(n || '?').split(/\s+/).filter(Boolean).slice(0, 2).map(w => w[0]).join('').toUpperCase();
 const TYPE_LABEL = { full_time: 'Full-time', part_time: 'Part-time', casual: 'Casual' };
 const TYPE_SHORT = { full_time: 'FT', part_time: 'PT', casual: 'Casual' };
@@ -719,6 +720,7 @@ const departments = () => [...new Set(state.positions.map(p => p.department || '
 async function api(method, path, body) {
   const opt = { method, headers: { 'X-ShiftTable': '1' }, credentials: 'same-origin' };
   if (body !== undefined) { opt.headers['Content-Type'] = 'application/json'; opt.body = JSON.stringify(body); }
+  if (opt.body && state.maxUpload && new Blob([opt.body]).size > state.maxUpload) throw new Error(`That's too large to upload here (the limit is ${fmtMB(state.maxUpload)}).`);
   let res;
   try { res = await fetch(path, opt); } catch (e) { throw new Error('Cannot reach the ShiftTable server. Is it still running?'); }
   let data = null;
@@ -904,7 +906,7 @@ $('#login').addEventListener('click', e => {
 async function loadBootstrap() {
   const b = await api('GET', '/api/bootstrap');
   Object.assign(state, { user: b.user, settings: b.settings, positions: b.positions, templates: b.templates, employees: b.employees,
-    needs: b.needs || [], me: b.me || null, today: b.today, leaveKinds: b.leave_kinds, branches: b.branches, demo: !!b.demo });
+    needs: b.needs || [], me: b.me || null, today: b.today, leaveKinds: b.leave_kinds, branches: b.branches, demo: !!b.demo, maxUpload: b.max_upload });
   state.posMap = Object.fromEntries(b.positions.map(p => [p.id, p]));
   state.empMap = Object.fromEntries(b.employees.map(e => [e.id, e]));
   state.branchMap = Object.fromEntries(b.branches.map(x => [x.id, x]));
@@ -2052,7 +2054,7 @@ ACTIONS['import-clock'] = () => {
     onSubmit: async (f, dlg) => {
       const file = f.elements.file.files[0];
       if (!file) throw new Error('Choose a CSV file.');
-      if (file.size > 10 * 1048576) throw new Error('That CSV is over 10 MB.');
+      if (file.size > state.maxUpload) throw new Error(`That CSV is over the ${fmtMB(state.maxUpload)} upload limit.`);
       if (!staged) {
         const text = await file.text();
         const r = await api('POST', '/api/data/import', { type: 'clock', csv: text, filename: file.name, commit: false });
@@ -2354,14 +2356,14 @@ ACTIONS['restore-snapshot'] = async el => {
 FORMS['restore-file'] = async f => {
   const file = f.elements.file.files[0];
   if (!file) return toast('Choose a .db or .json backup file.', 'err');
-  if (file.size > 18 * 1048576) return toast('That file is over 18 MB.', 'err');
+  if (file.size * 4 / 3 > state.maxUpload) return toast(`That file is too large to restore here: backups up to ${fmtMB(state.maxUpload * 3 / 4)} fit.`, 'err');  // sent base64-encoded
   if (!await confirmDialog({ title: `Restore ${file.name}?`, message: 'All current data and logins are replaced with this backup. The current data is saved as a safety snapshot first.', confirm: 'Restore', danger: true, typed: 'RESTORE' })) return;
   await busy($('button[type=submit]', f), async () => { const r = await api('POST', '/api/data/restore', { filename: file.name, content: await readBase64(file) }); afterRestore(`Restored ${file.name}. Safety copy: ${r.safety_backup}`); });
 };
 FORMS['import-preview'] = async f => {
   const file = f.elements.file.files[0], type = f.elements.type.value;
   if (!file) return toast('Choose a CSV file.', 'err');
-  if (file.size > 10 * 1048576) return toast('That CSV is over 10 MB.', 'err');
+  if (file.size > state.maxUpload) return toast(`That CSV is over the ${fmtMB(state.maxUpload)} upload limit.`, 'err');
   await busy($('button[type=submit]', f), async () => {
     const text = await file.text();
     const r = await api('POST', '/api/data/import', { type, csv: text, filename: file.name, commit: false });

@@ -1,9 +1,12 @@
-# Your data: never commit the database or its snapshots
+# Your data: never commit the database, its snapshots or the sign-in key
 roster.db
+*.key
 *.db-journal
 *.db-wal
 *.db-shm
 backups/
+
+tests/e2e/shots/
 
 __pycache__/
 *.pyc
